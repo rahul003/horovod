@@ -40,6 +40,10 @@ namespace common {
 #define NCCL_ALLREDUCE "NCCL_ALLREDUCE"
 #define MEMCPY_OUT_FUSION_BUFFER "MEMCPY_OUT_FUSION_BUFFER"
 #define MPI_BCAST "MPI_BCAST"
+#define NCCL_REDUCESCATTER "NCCL_REDUCESCATTER"
+#define NCCL_ALLGATHER "NCCL_ALLGATHER"
+#define CUDA_MEMCPY_ASYNC "CUDA_MEMCPY_ASYNC"
+#define MPI_ALLREDUCE "MPI_ALLREDUCE"
 
 // A callback to call after the MPI communication completes. Since the
 // allreduce and allgather ops are asynchronous, this callback is what resumes

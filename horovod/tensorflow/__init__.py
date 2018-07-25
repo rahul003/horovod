@@ -64,6 +64,8 @@ def allreduce(tensor, average=True, device_dense='', device_sparse=''):
     allgather on the values and the indices, effectively doing an allreduce on
     the represented tensor.
     """
+
+
     if isinstance(tensor, tf.IndexedSlices):
         with tf.device(device_sparse):
             # For IndexedSlices, do two allgathers intead of an allreduce.
@@ -77,11 +79,20 @@ def allreduce(tensor, average=True, device_dense='', device_sparse=''):
         return tf.IndexedSlices(new_values, indices,
                                 dense_shape=tensor.dense_shape)
     else:
+
         with tf.device(device_dense):
+
+            # cast tensor to fp16
+            tf.cast(tensor, dtype=tf.float16) 
+
             horovod_size = tf.cast(size(), tensor.dtype)
             summed_tensor = _allreduce(tensor)
             new_tensor = (tf.div(summed_tensor, horovod_size)
                           if average else summed_tensor)
+
+            # cast it back to fp32
+            tf.cast(new_tensor, dtype=tf.float32)
+
         return new_tensor
 
 
