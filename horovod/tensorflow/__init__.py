@@ -83,7 +83,7 @@ def allreduce(tensor, average=True, device_dense='', device_sparse=''):
         with tf.device(device_dense):
 
             # cast tensor to fp16
-            tf.cast(tensor, dtype=tf.float16) 
+            tensor = tf.cast(tensor, dtype=tf.float16) 
 
             horovod_size = tf.cast(size(), tensor.dtype)
             summed_tensor = _allreduce(tensor)
@@ -91,7 +91,7 @@ def allreduce(tensor, average=True, device_dense='', device_sparse=''):
                           if average else summed_tensor)
 
             # cast it back to fp32
-            tf.cast(new_tensor, dtype=tf.float32)
+            new_tensor = tf.cast(new_tensor, dtype=tf.float32)
 
         return new_tensor
 
