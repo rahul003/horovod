@@ -879,6 +879,7 @@ void PerformOperation(TensorTable& tensor_table, MPIResponse response) {
       // allreduce, and distribute results of allreduce back into target
       // tensors after allreduce.
 
+      const void* fused_input_data;
       void* buffer_data;
       int64_t num_elements = 0;
       size_t buffer_len;
@@ -904,11 +905,15 @@ void PerformOperation(TensorTable& tensor_table, MPIResponse response) {
           RECORD_EVENT(entries, event_queue, MEMCPY_IN_FUSION_BUFFER, stream)
         }
 
+        fused_input_data = buffer_data;
+
         // Perform the reduction on the fusion buffer.
         for (auto& e : entries) {
           num_elements += e.tensor->shape().num_elements();
         }
       } else {
+
+        fused_input_data = first_entry.tensor->data();
         buffer_data = (void*)first_entry.output->data();
         num_elements = first_entry.tensor->shape().num_elements();
         buffer_len = (size_t)first_entry.output->size();
