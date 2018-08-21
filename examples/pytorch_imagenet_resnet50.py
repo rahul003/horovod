@@ -6,14 +6,20 @@ import torch.nn.functional as F
 import torch.optim as optim
 import torch.utils.data.distributed
 from torchvision import datasets, transforms, models
+from torch.autograd import Variable
 import horovod.torch as hvd
 import tensorboardX
 import os
 from tqdm import tqdm
 
+from apex import amp
+
+# from imagenet_seq.data import Loader
+
 # Training settings
 parser = argparse.ArgumentParser(description='PyTorch ImageNet Example',
                                  formatter_class=argparse.ArgumentDefaultsHelpFormatter)
+parser.add_argument('--dummy-data', type=int, default=0, help='number of dummy images')
 parser.add_argument('--train-dir', default=os.path.expanduser('~/imagenet/train'),
                     help='path to training data')
 parser.add_argument('--val-dir', default=os.path.expanduser('~/imagenet/validation'),
@@ -22,26 +28,28 @@ parser.add_argument('--log-dir', default='./logs',
                     help='tensorboard log directory')
 parser.add_argument('--checkpoint-format', default='./checkpoint-{epoch}.pth.tar',
                     help='checkpoint file format')
-parser.add_argument('--batch-size', type=int, default=32,
+parser.add_argument('--batch-size', type=int, default=128,
                     help='input batch size for training')
-parser.add_argument('--val-batch-size', type=int, default=32,
+parser.add_argument('--val-batch-size', type=int, default=128,
                     help='input batch size for validation')
 parser.add_argument('--epochs', type=int, default=90,
                     help='number of epochs to train')
-parser.add_argument('--base-lr', type=float, default=0.0125,
+parser.add_argument('--base-lr', type=float, default=0.05,
                     help='learning rate for a single GPU')
 parser.add_argument('--warmup-epochs', type=float, default=5,
                     help='number of warmup epochs')
 parser.add_argument('--momentum', type=float, default=0.9,
                     help='SGD momentum')
-parser.add_argument('--wd', type=float, default=0.00005,
+parser.add_argument('--wd', type=float, default=0.0001,
                     help='weight decay')
 parser.add_argument('--no-cuda', action='store_true', default=False,
                     help='disables CUDA training')
 parser.add_argument('--seed', type=int, default=42,
                     help='random seed')
+parser.add_argument('--dtype', type=str, default='float32')
 args = parser.parse_args()
 args.cuda = not args.no_cuda and torch.cuda.is_available()
+amp_handle = amp.init(enabled=(args.dtype=='float16'))
 
 hvd.init()
 torch.manual_seed(args.seed)
@@ -71,38 +79,48 @@ verbose = 1 if hvd.rank() == 0 else 0
 # Horovod: write TensorBoard logs on first worker.
 log_writer = tensorboardX.SummaryWriter(args.log_dir) if hvd.rank() == 0 else None
 
+if not args.dummy_data:
+    kwargs = {'num_workers': 4, 'pin_memory': True} if args.cuda else {}
+    train_dataset = \
+        datasets.ImageFolder(args.train_dir,
+                             transform=transforms.Compose([
+                                 transforms.RandomResizedCrop(224),
+                                 transforms.RandomHorizontalFlip(),
+                                 transforms.ToTensor(),
+                                 transforms.Normalize(mean=[0.485, 0.456, 0.406],
+                                                      std=[0.229, 0.224, 0.225])
+                             ]))
+    val_dataset = \
+        datasets.ImageFolder(args.val_dir,
+                             transform=transforms.Compose([
+                                 transforms.Resize(256),
+                                 transforms.CenterCrop(224),
+                                 transforms.ToTensor(),
+                                 transforms.Normalize(mean=[0.485, 0.456, 0.406],
+                                                      std=[0.229, 0.224, 0.225])
+                             ]))
+else:
+    kwargs = {'num_workers': 4, 'pin_memory': True} if args.cuda else {}
+    train_dataset = datasets.FakeData(size=int(args.dummy_data), 
+        num_classes=1000, 
+        transform=transforms.Compose([ transforms.ToTensor() ]))
+    val_dataset = datasets.FakeData(size=int(args.dummy_data/10), 
+        num_classes=1000, 
+        transform=transforms.Compose([ transforms.ToTensor() ]))
 
-kwargs = {'num_workers': 4, 'pin_memory': True} if args.cuda else {}
-train_dataset = \
-    datasets.ImageFolder(args.train_dir,
-                         transform=transforms.Compose([
-                             transforms.RandomResizedCrop(224),
-                             transforms.RandomHorizontalFlip(),
-                             transforms.ToTensor(),
-                             transforms.Normalize(mean=[0.485, 0.456, 0.406],
-                                                  std=[0.229, 0.224, 0.225])
-                         ]))
 # Horovod: use DistributedSampler to partition data among workers. Manually specify
-# `num_replicas=hvd.size()` and `rank=hvd.rank()`.
+    # `num_replicas=hvd.size()` and `rank=hvd.rank()`.
 train_sampler = torch.utils.data.distributed.DistributedSampler(
     train_dataset, num_replicas=hvd.size(), rank=hvd.rank())
 train_loader = torch.utils.data.DataLoader(
     train_dataset, batch_size=args.batch_size, sampler=train_sampler, **kwargs)
-
-val_dataset = \
-    datasets.ImageFolder(args.val_dir,
-                         transform=transforms.Compose([
-                             transforms.Resize(256),
-                             transforms.CenterCrop(224),
-                             transforms.ToTensor(),
-                             transforms.Normalize(mean=[0.485, 0.456, 0.406],
-                                                  std=[0.229, 0.224, 0.225])
-                         ]))
 val_sampler = torch.utils.data.distributed.DistributedSampler(
-    val_dataset, num_replicas=hvd.size(), rank=hvd.rank())
+        val_dataset, num_replicas=hvd.size(), rank=hvd.rank())
 val_loader = torch.utils.data.DataLoader(val_dataset, batch_size=args.val_batch_size,
                                          sampler=val_sampler, **kwargs)
 
+# train_loader = Loader('train', batch_size=args.batch_size, num_workers=8)
+# val_loader = Loader('val', batch_size=args.val_batch_size, num_workers=4)
 
 # Set up standard ResNet-50 model.
 model = models.resnet50()
@@ -142,10 +160,14 @@ def train(epoch):
 
             if args.cuda:
                 data, target = data.cuda(), target.cuda()
+
+            if args.dummy_data:
+                target = Variable(target.long())
             optimizer.zero_grad()
             output = model(data)
             loss = F.cross_entropy(output, target)
-            loss.backward()
+            with amp_handle.scale_loss(loss, optimizer) as scaled_loss:
+                loss.backward()
             optimizer.step()
 
             train_loss.update(loss)
@@ -172,7 +194,8 @@ def validate(epoch):
                 if args.cuda:
                     data, target = data.cuda(), target.cuda()
                 output = model(data)
-
+                if args.dummy_data:
+                    target = Variable(target.long())
                 val_loss.update(F.cross_entropy(output, target))
                 val_accuracy.update(accuracy(output, target))
                 t.set_postfix({'loss': val_loss.avg.item(),
@@ -233,5 +256,6 @@ class Metric(object):
 
 for epoch in range(resume_from_epoch, args.epochs):
     train(epoch)
-    validate(epoch)
+    if epoch > 60:
+        validate(epoch)
     save_checkpoint(epoch)
