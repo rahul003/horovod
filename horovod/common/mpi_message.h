@@ -142,6 +142,9 @@ public:
   void set_tensor_sizes(const std::vector<int64_t>& value);
   void add_tensor_sizes(int64_t value);
 
+  bool shutdown() const;
+  void set_shutdown(bool value);
+
   static void ParseFromString(MPIResponse& response, const std::string& input);
   static void SerializeToString(MPIResponse& response, std::string& output);
 
@@ -151,6 +154,7 @@ private:
   std::string error_message_;
   std::vector<int32_t> devices_;
   std::vector<int64_t> tensor_sizes_;
+  bool shutdown_ = false;
 };
 
 class MPIResponseList {

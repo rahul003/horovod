@@ -51,7 +51,7 @@
  *
  * The primary logic of the allreduce, allgather and broadcast are in MPI and
  * NCCL implementations. The background thread which facilitates MPI operations
- * is run in BackgroundThreadLoop(). The provided ops are:
+ * is run in ControlThreadLoop(). The provided ops are:
  *      – HorovodAllreduce:
  *          Perform an allreduce on a Tensor, returning the sum
  *          across all MPI processes in the global communicator.
@@ -119,11 +119,15 @@ struct HorovodGlobalState {
   // Tensors waiting to be allreduced or allgathered.
   TensorTable tensor_table;
 
-  // Queue of MPI requests waiting to be sent to the coordinator node.
-  std::queue<MPIRequest> message_queue;
+  // Stack of MPI requests waiting to be sent to the coordinator node.
+  std::deque<MPIRequest> message_stack;
 
-  // Background thread running MPI communication.
-  std::thread background_thread;
+  // Stack of tensors ready to reduce only used on coordinator node
+  std::deque<MPIResponse> ready_responses;
+
+  // Control thread communicating meta messages with MPI
+  // Data thread running MPI/NCCL communication
+  std::unordered_map<std::string, std::thread> background_threads;
 
   // Whether the background thread should shutdown.
   std::atomic_bool shut_down {false};
@@ -163,7 +167,7 @@ struct HorovodGlobalState {
                      std::shared_ptr<PersistentBuffer>>
       tensor_fusion_buffers;
 
-  // Whether MPI_Init has been completed on the background thread.
+  // Whether MPI_Init has been completed on the background threads.
   std::atomic_bool initialization_done {false};
 
   // The MPI rank, local rank, size, local size, flag indicating whether MPI
@@ -187,7 +191,9 @@ struct HorovodGlobalState {
 
   // Private MPI communicator for Horovod to ensure no collisions with other
   // threads using MPI.
-  MPI_Comm mpi_comm;
+  MPI_Comm data_comm;
+
+  MPI_Comm control_comm;
 
   // Node-local communicator.
   MPI_Comm local_comm;
@@ -231,12 +237,14 @@ struct HorovodGlobalState {
 #endif
 
   ~HorovodGlobalState() {
-    // Make sure that the destructor of the background thread is safe to
+    // Make sure that the destructor of the background threads are safe to
     // call. If a thread is still joinable (not detached or complete) its
     // destructor cannot be called.
-    if (background_thread.joinable()) {
-      shut_down = true;
-      background_thread.join();
+    for (auto background_thread : background_threads) {
+      if (background_thread.joinable()) {
+        shut_down = true;
+        background_thread.join();
+      }
     }
   }
 };
@@ -306,7 +314,8 @@ bool IncrementTensorCount(std::unique_ptr<MessageTable>& message_table,
 //
 // Constructing the MPIResponse, thus, requires a whole lot of error checking.
 MPIResponse ConstructMPIResponse(std::unique_ptr<MessageTable>& message_table,
-                                 std::string name) {
+                                 std::string name, 
+                                 bool should_shut_down) {
   bool error = false;
   auto it = message_table->find(name);
   assert(it != message_table->end());
@@ -501,6 +510,7 @@ MPIResponse ConstructMPIResponse(std::unique_ptr<MessageTable>& message_table,
     response.set_response_type(MPIResponse::BROADCAST);
   }
   response.set_devices(devices);
+  response.set_shutdown(should_shut_down);
 
   // Clear all queued up requests for this name. They are now taken care of
   // by the constructed MPI response.
@@ -839,7 +849,7 @@ void PerformOperation(TensorTable& tensor_table, MPIResponse response) {
     auto result = MPI_Allgatherv(
         e.tensor->data(), (int)e.tensor->shape().num_elements(),
         GetMPIDataType(e.tensor), (void*)e.output->data(), recvcounts,
-        displcmnts, GetMPIDataType(e.tensor), horovod_global.mpi_comm);
+        displcmnts, GetMPIDataType(e.tensor), horovod_global.data_comm);
     delete[] recvcounts;
     delete[] displcmnts;
     MPI_CHECK(entries, "MPI_Allgatherv", result)
@@ -899,7 +909,7 @@ void PerformOperation(TensorTable& tensor_table, MPIResponse response) {
         } else {
           nccl_rank = horovod_global.rank;
           nccl_size = horovod_global.size;
-          nccl_id_bcast_comm = horovod_global.mpi_comm;
+          nccl_id_bcast_comm = horovod_global.data_comm;
         }
 
         ncclUniqueId nccl_id;
@@ -919,7 +929,7 @@ void PerformOperation(TensorTable& tensor_table, MPIResponse response) {
 
         // Barrier helps NCCL to synchronize after initialization and avoid
         // deadlock that we've been seeing without it.
-        MPI_CHECK(entries, "MPI_Barrier", MPI_Barrier(horovod_global.mpi_comm));
+        MPI_CHECK(entries, "MPI_Barrier", MPI_Barrier(horovod_global.data_comm));
 
         ACTIVITY_END_ALL(entries, timeline)
       }
@@ -1264,7 +1274,7 @@ void PerformOperation(TensorTable& tensor_table, MPIResponse response) {
                 MPI_Allreduce(MPI_IN_PLACE, (void*)buffer_data,
                               (int)num_elements,
                               GetMPIDataType(first_entry.tensor), MPI_SUM,
-                              horovod_global.mpi_comm))
+                              horovod_global.data_comm))
       ACTIVITY_END_ALL(entries, timeline)
 
       // Copy memory out of the fusion buffer.
@@ -1306,7 +1316,7 @@ void PerformOperation(TensorTable& tensor_table, MPIResponse response) {
                 MPI_Allreduce(sendbuf, (void*)e.output->data(),
                               (int)e.tensor->shape().num_elements(),
                               GetMPIDataType(e.tensor), MPI_SUM,
-                              horovod_global.mpi_comm))
+                              horovod_global.data_comm))
       ACTIVITY_END_ALL(entries, timeline)
     }
 
@@ -1330,7 +1340,7 @@ void PerformOperation(TensorTable& tensor_table, MPIResponse response) {
     MPI_CHECK(entries, "MPI_Bcast",
               MPI_Bcast(data_ptr, (int)e.tensor->shape().num_elements(),
                         GetMPIDataType(e.tensor), e.root_rank,
-                        horovod_global.mpi_comm))
+                        horovod_global.data_comm))
     ACTIVITY_END_ALL(entries, timeline)
 
     timeline.End(e.tensor_name, e.output);
@@ -1416,7 +1426,7 @@ void CheckForStalledTensors(HorovodGlobalState& state) {
 //      otherwise we may end up dispatching many blocked threads and never make
 //      progress if we have a thread pool limit.
 bool RunLoopOnce(HorovodGlobalState& state, bool is_coordinator);
-void BackgroundThreadLoop(HorovodGlobalState& state) {
+void ControlThreadLoop(HorovodGlobalState& state) {
   // Initialize MPI if it was not initialized. This must happen on the
   // background thread, since not all MPI implementations support being called
   // from multiple threads.
@@ -1456,33 +1466,35 @@ void BackgroundThreadLoop(HorovodGlobalState& state) {
     MPI_Group work_group;
     MPI_Group_incl(world_group, state.ranks.size(), &(state.ranks[0]),
                    &work_group);
-    MPI_Comm_create_group(MPI_COMM_WORLD, work_group, 0, &(state.mpi_comm));
-    if (state.mpi_comm == MPI_COMM_NULL) {
+    MPI_Comm_create_group(MPI_COMM_WORLD, work_group, 0, &(state.data_comm));
+    if (state.data_comm == MPI_COMM_NULL) {
       std::cerr << "WARNING: Unable to create Horovod communicator, using "
                    "MPI_COMM_WORLD instead."
                 << std::endl;
-      state.mpi_comm = MPI_COMM_WORLD;
+      state.data_comm = MPI_COMM_WORLD;
     }
     MPI_Group_free(&world_group);
     MPI_Group_free(&work_group);
-  } else if (!state.mpi_comm) {
+  } else if (!state.data_comm) {
     // No ranks were given and no communicator provided to horovod_init() so use
     // MPI_COMM_WORLD
-    MPI_Comm_dup(MPI_COMM_WORLD, &(horovod_global.mpi_comm));
+    MPI_Comm_dup(MPI_COMM_WORLD, &(horovod_global.data_comm));
   }
+
+  MPI_Comm_dup(horovod_global.data_comm, &(horovod_global.control_comm));
 
   // Get MPI rank to determine if we are rank zero.
   int rank;
-  MPI_Comm_rank(state.mpi_comm, &rank);
+  MPI_Comm_rank(state.control_comm, &rank);
   bool is_coordinator = rank == 0;
 
   // Get MPI size to determine how many tensors to wait for before reducing.
   int size;
-  MPI_Comm_size(state.mpi_comm, &size);
+  MPI_Comm_size(state.control_comm, &size);
 
   // Determine local rank by querying the local communicator.
   MPI_Comm local_comm;
-  MPI_Comm_split_type(state.mpi_comm, MPI_COMM_TYPE_SHARED, 0, MPI_INFO_NULL,
+  MPI_Comm_split_type(state.control_comm, MPI_COMM_TYPE_SHARED, 0, MPI_INFO_NULL,
                       &local_comm);
   int local_rank, local_size;
   MPI_Comm_rank(local_comm, &local_rank);
@@ -1496,7 +1508,7 @@ void BackgroundThreadLoop(HorovodGlobalState& state) {
   // local_size
   auto local_sizes = new int[size];
   MPI_Allgather(&local_size, 1, MPI_INT, local_sizes, 1, MPI_INT,
-                state.mpi_comm);
+                state.control_comm);
 
   bool is_homogeneous = true;
   for (int i = 0; i < size; i++) {
@@ -1510,7 +1522,7 @@ void BackgroundThreadLoop(HorovodGlobalState& state) {
 
   // Set up cross-communicator in case of hierarchical allreduce.
   MPI_Comm cross_comm;
-  MPI_Comm_split(state.mpi_comm, local_rank, rank, &cross_comm);
+  MPI_Comm_split(state.control_comm, local_rank, rank, &cross_comm);
   int cross_rank, cross_size;
   MPI_Comm_rank(cross_comm, &cross_rank);
   MPI_Comm_size(cross_comm, &cross_size);
@@ -1629,13 +1641,25 @@ void BackgroundThreadLoop(HorovodGlobalState& state) {
       callbacks.emplace_back(e.second.callback);
     }
     state.tensor_table.clear();
-    while (!state.message_queue.empty()) {
-      state.message_queue.pop();
+    while (!state.message_stack.empty()) {
+      state.message_stack.pop();
     }
   }
   for (auto& cb : callbacks) {
     cb(SHUT_DOWN_ERROR);
   }
+}
+
+void Sleep() {
+  // This delay determines thread frequency and MPI message latency
+  auto sleep_duration =
+      state.last_cycle_start +
+      std::chrono::microseconds(long(state.cycle_time_ms * 1000.)) -
+      std::chrono::steady_clock::now();
+  if (sleep_duration > std::chrono::steady_clock::duration::zero()) {
+    std::this_thread::sleep_for(sleep_duration);
+  }
+  state.last_cycle_start = std::chrono::steady_clock::now();
 }
 
 // The coordinator currently follows a master-worker paradigm. Rank zero acts
@@ -1668,27 +1692,18 @@ void BackgroundThreadLoop(HorovodGlobalState& state) {
 //      If instead of "DONE" they receive "SHUTDOWN", they exit their background
 //      loop.
 bool RunLoopOnce(HorovodGlobalState& state, bool is_coordinator) {
-  // This delay determines thread frequency and MPI message latency
-  auto sleep_duration =
-      state.last_cycle_start +
-      std::chrono::microseconds(long(state.cycle_time_ms * 1000.)) -
-      std::chrono::steady_clock::now();
-  if (sleep_duration > std::chrono::steady_clock::duration::zero()) {
-    std::this_thread::sleep_for(sleep_duration);
-  }
-  state.last_cycle_start = std::chrono::steady_clock::now();
-
   // Copy the data structures from global state under this lock.
   // However, don't keep the lock for the rest of the loop, so that
   // enqueued stream callbacks can continue.
-  std::queue<MPIRequest> message_queue;
+  std::deque<MPIRequest> message_stack;
   {
     std::lock_guard<std::mutex> guard(state.mutex);
-    while (!state.message_queue.empty()) {
-      MPIRequest message = state.message_queue.front();
-      state.message_queue.pop();
-      message_queue.push(message);
-    }
+    message_stack = state.message_stack;
+  }
+
+  if (message_stack.empty()) {
+    Sleep();
+    return true;
   }
 
   // Flag indicating that the background thread should shut down.
@@ -1697,17 +1712,17 @@ bool RunLoopOnce(HorovodGlobalState& state, bool is_coordinator) {
   // Collect all tensors that are ready to be reduced. Record them in the
   // tensor count table (rank zero) or send them to rank zero to be
   // recorded (everyone else).
-  std::vector<std::string> ready_to_reduce;
+  std::deque<std::string> ready_to_reduce;
   if (is_coordinator) {
-    while (!message_queue.empty()) {
+    while (!message_stack.empty()) {
       // Pop the first available message message
-      MPIRequest message = message_queue.front();
-      message_queue.pop();
+      MPIRequest message = message_stack.back();
+      message_stack.pop_back();
 
       bool reduce =
           IncrementTensorCount(state.message_table, message, state.size);
       if (reduce) {
-        ready_to_reduce.push_back(message.tensor_name());
+        ready_to_reduce.push_front(message.tensor_name());
       }
     }
 
@@ -1719,7 +1734,7 @@ bool RunLoopOnce(HorovodGlobalState& state, bool is_coordinator) {
     auto recvcounts = new int[state.size];
     recvcounts[0] = 0;
     MPI_Gather(MPI_IN_PLACE, 1, MPI_INT, recvcounts, 1, MPI_INT, RANK_ZERO,
-               state.mpi_comm);
+               state.control_comm);
 
     // 2. Compute displacements.
     auto displcmnts = new int[state.size];
@@ -1736,7 +1751,7 @@ bool RunLoopOnce(HorovodGlobalState& state, bool is_coordinator) {
     // 3. Collect messages from every rank.
     auto buffer = new char[total_size];
     MPI_Gatherv(nullptr, 0, MPI_BYTE, buffer, recvcounts, displcmnts, MPI_BYTE,
-                RANK_ZERO, state.mpi_comm);
+                RANK_ZERO, state.control_comm);
 
     // 4. Process messages.
     for (int i = 1; i < state.size; i++) {
@@ -1750,7 +1765,7 @@ bool RunLoopOnce(HorovodGlobalState& state, bool is_coordinator) {
         bool reduce = IncrementTensorCount(state.message_table,
                                            received_message, state.size);
         if (reduce) {
-          ready_to_reduce.push_back(received_name);
+          ready_to_reduce.push_front(received_name);
         }
       }
       if (received_message_list.shutdown()) {
@@ -1770,65 +1785,23 @@ bool RunLoopOnce(HorovodGlobalState& state, bool is_coordinator) {
     // to rank zero. We can now do reductions and gathers; rank zero will
     // choose which ones and in what order, and will notify the other ranks
     // before doing each reduction.
+
     std::deque<MPIResponse> responses;
-    for (auto& tensor_name : ready_to_reduce) {
+    while (!ready_to_reduce.empty()) {
+      auto tensor_name = ready_to_reduce.back();
+      ready_to_reduce.pop_back();
       MPIResponse response =
-          ConstructMPIResponse(state.message_table, tensor_name);
-      responses.push_back(std::move(response));
+          ConstructMPIResponse(state.message_table, tensor_name, should_shut_down);
+      responses.push_front(std::move(response));
     }
 
-    MPIResponseList response_list;
-    response_list.set_shutdown(should_shut_down);
-
-    while (!responses.empty()) {
-      auto response = responses.front();
-      assert(response.tensor_names().size() == 1);
-      responses.pop_front();
-
-      if (response.response_type() == MPIResponse::ResponseType::ALLREDUCE) {
-        // Attempt to add more responses to this fused response.
-        auto& entry = state.tensor_table[response.tensor_names()[0]];
-        int64_t tensor_size = entry.tensor->size();
-
-        while (!responses.empty()) {
-          auto new_response = responses.front();
-          assert(new_response.tensor_names().size() == 1);
-          auto& new_entry = state.tensor_table[new_response.tensor_names()[0]];
-          int64_t new_tensor_size = new_entry.tensor->size();
-
-          if (response.response_type() == new_response.response_type() &&
-              response.devices() == new_response.devices() &&
-              entry.tensor->dtype() == new_entry.tensor->dtype() &&
-              tensor_size + new_tensor_size <= state.tensor_fusion_threshold) {
-            // These tensors will fuse together well.
-            tensor_size += new_tensor_size;
-            response.add_tensor_names(new_response.tensor_names()[0]);
-            responses.pop_front();
-          } else {
-            // Don't try to fuse additional tensors since they are usually
-            // computed in order of requests and skipping tensors may mean
-            // that the batch will have to wait longer while skipped tensors
-            // could be reduced at that time.
-            break;
-          }
-        }
+    {
+      std::lock_guard<std::mutex> guard(horovod_global.mutex);
+      while (!responses.empty()) {
+        auto resp = responses.back();
+        responses.pop_back();
+        state.ready_responses.push_front(resp);
       }
-
-      response_list.add_responses(response);
-    }
-
-    // Notify all nodes which tensors we'd like to reduce at this step.
-    std::string encoded_response;
-    MPIResponseList::SerializeToString(response_list, encoded_response);
-    int encoded_response_length = (int)encoded_response.length() + 1;
-    MPI_Bcast(&encoded_response_length, 1, MPI_INT, RANK_ZERO, state.mpi_comm);
-    MPI_Bcast((void*)encoded_response.c_str(), encoded_response_length,
-              MPI_BYTE, RANK_ZERO, state.mpi_comm);
-
-    // Perform the collective operation. All nodes should end up performing
-    // the same operation.
-    for (auto& response : response_list.responses()) {
-      PerformOperation(state.tensor_table, response);
     }
 
     // Check for stalled tensors.
@@ -1839,42 +1812,89 @@ bool RunLoopOnce(HorovodGlobalState& state, bool is_coordinator) {
       state.last_stall_check = std::chrono::steady_clock::now();
     }
   } else {
+
+    // send requests to coordinator
     std::string encoded_message;
     MPIRequestList message_list;
     message_list.set_shutdown(should_shut_down);
-    while (!message_queue.empty()) {
-      message_list.add_requests(message_queue.front());
-      message_queue.pop();
+    while (!message_stack.empty()) {
+      message_list.add_requests(message_stack.top());
+      message_stack.pop();
     }
     MPIRequestList::SerializeToString(message_list, encoded_message);
     int encoded_message_length = (int)encoded_message.length() + 1;
     MPI_Gather(&encoded_message_length, 1, MPI_INT, nullptr, 1, MPI_INT,
-               RANK_ZERO, state.mpi_comm);
+               RANK_ZERO, state.control_comm);
     MPI_Gatherv((void*)encoded_message.c_str(), encoded_message_length,
                 MPI_BYTE, nullptr, nullptr, nullptr, MPI_BYTE, RANK_ZERO,
-                state.mpi_comm);
+                state.control_comm);
 
-    int msg_length;
-    MPI_Bcast(&msg_length, 1, MPI_INT, RANK_ZERO, state.mpi_comm);
-    auto buffer = new char[msg_length];
-    MPI_Bcast(buffer, msg_length, MPI_BYTE, RANK_ZERO, state.mpi_comm);
-    std::string received_message(buffer, (size_t)msg_length);
-    MPIResponseList response_list;
-    MPIResponseList::ParseFromString(response_list, received_message);
-    delete[] buffer;
+    // // receive response for which tensor to allreduce 
+    // int msg_length;
+    // MPI_Bcast(&msg_length, 1, MPI_INT, RANK_ZERO, state.mpi_comm);
+    // auto buffer = new char[msg_length];
+    // MPI_Bcast(buffer, msg_length, MPI_BYTE, RANK_ZERO, state.mpi_comm);
+    // std::string received_message(buffer, (size_t)msg_length);
+    // MPIResponse response;
+    // MPIResponse::ParseFromString(response, received_message);
+    // delete[] buffer;
 
-    // Perform the collective operation. All nodes should end up performing
-    // the same operation.
-    for (auto& response : response_list.responses()) {
-      PerformOperation(state.tensor_table, response);
+    // // Perform the collective operation. All nodes should end up performing
+    // // the same operation.
+    // PerformOperation(state.tensor_table, response);
+
+    // if (response.shutdown()) {
+    //   should_shut_down = true;
+    // }
+  }
+
+  // TODO: should behavior be that if should_shutdown is true and tensor table empty
+  // then actually shutdown
+  return (!should_shut_down);
+}
+
+void DataThreadLoop(HorovodGlobalState& state) {
+  bool should_shut_down = false;
+  while (!should_shut_down) {
+    MPIResponse resp;
+    if (state.is_coordinator) {
+      std::deque<MPIResponse> ready_responses;
+      {
+        std::lock_guard<std::mutex> guard(horovod_global.mutex);
+        ready_responses = horovod_global.ready_responses;
+      }
+      if (ready_responses.empty()) {
+        Sleep();
+        continue;
+      } else {
+        resp = ready_responses.front();
+        ready_responses.pop_front();
+      
+      }
+      std::string encoded_response;
+      MPIResponse::SerializeToString(resp, encoded_response);
+      int encoded_response_length = (int) encoded_response.length() + 1;
+      MPI_Bcast(&encoded_response_length, 1, MPI_INT, RANK_ZERO, state.data_comm);
+      MPI_Bcast((void*)encoded_response.c_str(), encoded_response_length,
+        MPI_BYTE, RANK_ZERO, state.data_comm);
+    } else {
+      int msg_length;
+      // blocks till this call is made
+      MPI_Bcast(&msg_length, 1, MPI_INT, RANK_ZERO, state.data_comm);
+      auto buffer = new char[msg_length];
+      MPI_Bcast(buffer, msg_length, MPI_BYTE, RANK_ZERO, state.data_comm);
+      std::string received_message(buffer, (size_t)msg_length);
+      MPIResponse::ParseFromString(resp, received_message);
+      delete[] buffer;
     }
 
-    if (response_list.shutdown()) {
+    // TODO tensor_table.erase() in perform operation
+    PerformOperation(state.tensor_table, resp);
+
+    if (resp.shutdown()) {
       should_shut_down = true;
     }
   }
-
-  return !should_shut_down;
 }
 
 // Start Horovod background thread. Ensure that this is
@@ -1889,8 +1909,12 @@ void InitializeHorovodOnce(const int* ranks, int nranks) {
     // Reset initialization flag
     horovod_global.initialization_done = false;
 
-    horovod_global.background_thread =
-        std::thread(BackgroundThreadLoop, std::ref(horovod_global));
+    horovod_global.background_threads['control'] =
+        std::thread(ControlThreadLoop, std::ref(horovod_global));
+
+    horovod_global.background_threads['data'] = 
+        std::thread(DataThreadLoop, std::ref(horovod_global));
+
   }
 
   // Wait to ensure that the background thread has finished initializing MPI.
@@ -1920,13 +1944,17 @@ void horovod_init_comm(MPI_Comm comm) {
 }
 
 void horovod_shutdown() {
-  if (horovod_global.background_thread.joinable()) {
-    horovod_global.shut_down = true;
-    horovod_global.background_thread.join();
-    // Reset the initialization flag to allow restarting with horovod_init(...)
-    horovod_global.initialize_flag.clear();
-    horovod_global.shut_down = false;
+
+  auto background_threads = horovod_global.background_threads;
+  horovod_global.shut_down = true;
+  for (unsigned int i=0; i < background_threads.size(); i++) {
+    if (background_threads[i].joinable()) {
+      background_threads[i].join();
+    }
   }
+  // Reset the initialization flag to allow restarting with horovod_init(...)
+  horovod_global.initialize_flag.clear();
+  horovod_global.shut_down = false;
 
   if (horovod_global.mpi_comm != MPI_COMM_NULL &&
       horovod_global.mpi_comm != MPI_COMM_WORLD) {
@@ -2012,7 +2040,7 @@ Status EnqueueTensorAllreduce(std::shared_ptr<OpContext> context,
   for (int i = 0; i < tensor->shape().dims(); i++) {
     message.add_tensor_shape((int64_t)tensor->shape().dim_size(i));
   }
-
+  
   TensorTableEntry e;
   e.tensor_name = name;
   e.context = context;
@@ -2025,7 +2053,7 @@ Status EnqueueTensorAllreduce(std::shared_ptr<OpContext> context,
   std::lock_guard<std::mutex> guard(horovod_global.mutex);
   if (!horovod_global.shut_down) {
     horovod_global.tensor_table.emplace(name, std::move(e));
-    horovod_global.message_queue.push(message);
+    horovod_global.message_stack.push(message);
     return Status::OK();
   } else {
     return SHUT_DOWN_ERROR;
@@ -2060,7 +2088,7 @@ Status EnqueueTensorAllgather(std::shared_ptr<OpContext> context,
   std::lock_guard<std::mutex> guard(horovod_global.mutex);
   if (!horovod_global.shut_down) {
     horovod_global.tensor_table.emplace(name, std::move(e));
-    horovod_global.message_queue.push(message);
+    horovod_global.message_stack.push(message);
     return Status::OK();
   } else {
     return SHUT_DOWN_ERROR;
@@ -2099,7 +2127,7 @@ Status EnqueueTensorBroadcast(std::shared_ptr<OpContext> context,
   std::lock_guard<std::mutex> guard(horovod_global.mutex);
   if (!horovod_global.shut_down) {
     horovod_global.tensor_table.emplace(name, std::move(e));
-    horovod_global.message_queue.push(message);
+    horovod_global.message_stack.push(message);
     return Status::OK();
   } else {
     return SHUT_DOWN_ERROR;
