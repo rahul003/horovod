@@ -1487,8 +1487,12 @@ void ControlThreadLoop(HorovodGlobalState& state) {
     // MPI_COMM_WORLD
     MPI_Comm_dup(MPI_COMM_WORLD, &(horovod_global.data_comm));
   }
+  
+  std::cout << "Created data communicator";
 
   MPI_Comm_dup(horovod_global.data_comm, &(horovod_global.control_comm));
+  
+  std::cout << "Created control communicator";
 
   // Get MPI rank to determine if we are rank zero.
   int rank;
@@ -1619,6 +1623,8 @@ void ControlThreadLoop(HorovodGlobalState& state) {
 
   // Signal that initialization is completed.
   state.initialization_done = true;
+
+  std::cout << rank << " : Horovod Initialization done";
 
   // Iterate until shutdown.
   while (RunLoopOnce(state, is_coordinator))
