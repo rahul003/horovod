@@ -22,6 +22,8 @@
 #include <thread>
 #include <unordered_map>
 #include <unordered_set>
+#include <stack>
+#include <deque>
 
 #if HAVE_CUDA
 #include <cuda_runtime.h>
@@ -120,14 +122,14 @@ struct HorovodGlobalState {
   TensorTable tensor_table;
 
   // Stack of MPI requests waiting to be sent to the coordinator node.
-  std::deque<MPIRequest> message_stack;
+  std::stack<MPIRequest> message_stack;
 
   // Stack of tensors ready to reduce only used on coordinator node
   std::deque<MPIResponse> ready_responses;
 
   // Control thread communicating meta messages with MPI
   // Data thread running MPI/NCCL communication
-  std::unordered_map<std::string, std::thread> background_threads;
+  std::vector<std::thread> background_threads;
 
   // Whether the background thread should shutdown.
   std::atomic_bool shut_down {false};
@@ -240,13 +242,18 @@ struct HorovodGlobalState {
     // Make sure that the destructor of the background threads are safe to
     // call. If a thread is still joinable (not detached or complete) its
     // destructor cannot be called.
-    for (auto background_thread : background_threads) {
-      if (background_thread.joinable()) {
-        shut_down = true;
-        background_thread.join();
+    JoinBackgroundThreads();
+    shut_down = true;
+  }
+
+  void JoinBackgroundThreads() {
+    for (int i=0; i<background_threads.size(); i++) {
+      if (background_threads[i].joinable()) {
+        background_threads[i].join();
       }
     }
   }
+
 };
 
 // All the Horovod state that must be stored globally per-process.
@@ -1650,7 +1657,7 @@ void ControlThreadLoop(HorovodGlobalState& state) {
   }
 }
 
-void Sleep() {
+void Sleep(HorovodGlobalState& state) {
   // This delay determines thread frequency and MPI message latency
   auto sleep_duration =
       state.last_cycle_start +
@@ -1695,14 +1702,19 @@ bool RunLoopOnce(HorovodGlobalState& state, bool is_coordinator) {
   // Copy the data structures from global state under this lock.
   // However, don't keep the lock for the rest of the loop, so that
   // enqueued stream callbacks can continue.
-  std::deque<MPIRequest> message_stack;
+  std::deque<MPIRequest> message_deque;
   {
     std::lock_guard<std::mutex> guard(state.mutex);
-    message_stack = state.message_stack;
+    while (!state.message_stack.empty()) {
+      auto msg = state.message_stack.top();
+      state.message_stack.pop();
+      message_deque.push_back(msg);
+    }
+    // message_deque will have same order as stack now
   }
 
-  if (message_stack.empty()) {
-    Sleep();
+  if (message_deque.empty()) {
+    Sleep(state);
     return true;
   }
 
@@ -1714,10 +1726,10 @@ bool RunLoopOnce(HorovodGlobalState& state, bool is_coordinator) {
   // recorded (everyone else).
   std::deque<std::string> ready_to_reduce;
   if (is_coordinator) {
-    while (!message_stack.empty()) {
+    while (!message_deque.empty()) {
       // Pop the first available message message
-      MPIRequest message = message_stack.back();
-      message_stack.pop_back();
+      MPIRequest message = message_deque.back();
+      message_deque.pop_back();
 
       bool reduce =
           IncrementTensorCount(state.message_table, message, state.size);
@@ -1817,9 +1829,9 @@ bool RunLoopOnce(HorovodGlobalState& state, bool is_coordinator) {
     std::string encoded_message;
     MPIRequestList message_list;
     message_list.set_shutdown(should_shut_down);
-    while (!message_stack.empty()) {
-      message_list.add_requests(message_stack.top());
-      message_stack.pop();
+    while (!message_deque.empty()) {
+      message_list.add_requests(message_deque.front());
+      message_deque.pop_front();
     }
     MPIRequestList::SerializeToString(message_list, encoded_message);
     int encoded_message_length = (int)encoded_message.length() + 1;
@@ -1854,17 +1866,18 @@ bool RunLoopOnce(HorovodGlobalState& state, bool is_coordinator) {
 }
 
 void DataThreadLoop(HorovodGlobalState& state) {
+  bool is_coordinator = state.rank == 0;
   bool should_shut_down = false;
   while (!should_shut_down) {
     MPIResponse resp;
-    if (state.is_coordinator) {
+    if (is_coordinator) {
       std::deque<MPIResponse> ready_responses;
       {
         std::lock_guard<std::mutex> guard(horovod_global.mutex);
         ready_responses = horovod_global.ready_responses;
       }
       if (ready_responses.empty()) {
-        Sleep();
+        Sleep(state);
         continue;
       } else {
         resp = ready_responses.front();
@@ -1909,12 +1922,13 @@ void InitializeHorovodOnce(const int* ranks, int nranks) {
     // Reset initialization flag
     horovod_global.initialization_done = false;
 
-    horovod_global.background_threads['control'] =
-        std::thread(ControlThreadLoop, std::ref(horovod_global));
+    horovod_global.background_threads.push_back(std::thread(ControlThreadLoop, std::ref(horovod_global)));
 
-    horovod_global.background_threads['data'] = 
-        std::thread(DataThreadLoop, std::ref(horovod_global));
+    while (!horovod_global.initialization_done) {
+      Sleep(horovod_global);
+    }
 
+    horovod_global.background_threads.push_back(std::thread(DataThreadLoop, std::ref(horovod_global)));
   }
 
   // Wait to ensure that the background thread has finished initializing MPI.
@@ -1939,26 +1953,28 @@ void horovod_init(const int* ranks, int nranks) {
 }
 
 void horovod_init_comm(MPI_Comm comm) {
-  MPI_Comm_dup(comm, &(horovod_global.mpi_comm));
+  MPI_Comm_dup(comm, &(horovod_global.data_comm));
   InitializeHorovodOnce(NULL, 0);
 }
 
 void horovod_shutdown() {
 
-  auto background_threads = horovod_global.background_threads;
   horovod_global.shut_down = true;
-  for (unsigned int i=0; i < background_threads.size(); i++) {
-    if (background_threads[i].joinable()) {
-      background_threads[i].join();
-    }
-  }
+
+  horovod_global.JoinBackgroundThreads();
+
   // Reset the initialization flag to allow restarting with horovod_init(...)
   horovod_global.initialize_flag.clear();
   horovod_global.shut_down = false;
 
-  if (horovod_global.mpi_comm != MPI_COMM_NULL &&
-      horovod_global.mpi_comm != MPI_COMM_WORLD) {
-    MPI_Comm_free(&horovod_global.mpi_comm);
+  if (horovod_global.data_comm != MPI_COMM_NULL &&
+      horovod_global.data_comm != MPI_COMM_WORLD) {
+    MPI_Comm_free(&horovod_global.data_comm);
+  }
+
+  if (horovod_global.control_comm != MPI_COMM_NULL &&
+      horovod_global.control_comm != MPI_COMM_WORLD) {
+    MPI_Comm_free(&horovod_global.control_comm);
   }
 
   if (horovod_global.local_comm != MPI_COMM_NULL) {
