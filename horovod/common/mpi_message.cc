@@ -289,6 +289,11 @@ bool MPIResponse::shutdown() const { return shutdown_; }
 
 void MPIResponse::set_shutdown(bool value) { shutdown_ = value; }
 
+bool MPIResponse::initialized() const { return initialized_; }
+
+void MPIResponse::set_initialized(bool value) { initialized_ = value; }
+
+
 void MPIResponse_ParseFromWire(MPIResponse& response,
                               const wire::MPIResponse* obj) {
   response.set_response_type((MPIResponse::ResponseType)obj->response_type());

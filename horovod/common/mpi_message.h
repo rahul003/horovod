@@ -145,6 +145,9 @@ public:
   bool shutdown() const;
   void set_shutdown(bool value);
 
+  bool initialized() const;
+  void set_initialized(bool value);
+
   static void ParseFromString(MPIResponse& response, const std::string& input);
   static void SerializeToString(MPIResponse& response, std::string& output);
 
@@ -155,6 +158,7 @@ private:
   std::vector<int32_t> devices_;
   std::vector<int64_t> tensor_sizes_;
   bool shutdown_ = false;
+  bool initialized_ = false;
 };
 
 class MPIResponseList {
