@@ -1622,6 +1622,8 @@ void ControlThreadLoop(HorovodGlobalState& state) {
   // Iterate until shutdown.
   while (RunLoopOnce(state, is_coordinator))
     ;
+  
+  std::cout << "shutting down control thread for rank:" << rank << std::endl;
 
   // Signal that shutdown has been requested.
   state.shut_down = true;
@@ -1866,7 +1868,8 @@ bool RunLoopOnce(HorovodGlobalState& state, bool is_coordinator) {
 }
 
 void DataThreadLoop(HorovodGlobalState& state) {
-  bool is_coordinator = state.rank == 0;
+  int rank = state.rank;
+  bool is_coordinator = rank == 0;
   bool should_shut_down = false;
   while (!should_shut_down) {
     MPIResponse resp;
@@ -1906,8 +1909,11 @@ void DataThreadLoop(HorovodGlobalState& state) {
 
     if (resp.shutdown()) {
       should_shut_down = true;
+      state.shut_down = true;
+      std::cout << "shutting down data thread for rank:" << rank << std::endl;
     }
   }
+  std::cout << "shut down data thread for rank:" << rank << std::endl;
 }
 
 // Start Horovod background thread. Ensure that this is
@@ -1918,23 +1924,16 @@ void InitializeHorovodOnce(const int* ranks, int nranks) {
     for (int i = 0; i < nranks; i++) {
       horovod_global.ranks.push_back(ranks[i]);
     }
-
     // Reset initialization flag
     horovod_global.initialization_done = false;
-
     horovod_global.background_threads.push_back(std::thread(ControlThreadLoop, std::ref(horovod_global)));
-
-    while (!horovod_global.initialization_done) {
-      Sleep(horovod_global);
-    }
-
-    horovod_global.background_threads.push_back(std::thread(DataThreadLoop, std::ref(horovod_global)));
   }
 
   // Wait to ensure that the background thread has finished initializing MPI.
   while (!horovod_global.initialization_done) {
     std::this_thread::sleep_for(std::chrono::milliseconds(1));
   }
+  horovod_global.background_threads.push_back(std::thread(DataThreadLoop, std::ref(horovod_global)));
 }
 
 } // namespace
