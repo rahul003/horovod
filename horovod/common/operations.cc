@@ -1875,17 +1875,40 @@ void DataThreadLoop(HorovodGlobalState& state) {
   bool is_coordinator = rank == 0;
   bool should_shut_down = false;
   while (!should_shut_down) {
-    MPIResponse resp;
+    MPIResponse response;
     if (is_coordinator) {
       {
-        std::lock_guard<std::mutex> guard(horovod_global.mutex);
-        if (!horovod_global.ready_responses.empty()) {
-          resp = horovod_global.ready_responses.front();
-          resp.set_initialized(true);
-          horovod_global.ready_responses.pop_front();
+        std::lock_guard<std::mutex> guard(state.mutex);
+
+        if (!state.ready_responses.empty()) {
+          response = state.ready_responses.front();
+          assert(response.tensor_names().size() == 1);
+          state.ready_responses.pop_front();
+          response.set_initialized(true);
+          if (response.response_type() == MPIResponse::ResponseType::ALLREDUCE) {
+            auto& entry = state.tensor_table[response.tensor_names()[0]];
+            int64_t tensor_size = entry.tensor->size();
+            while (!state.ready_responses.empty()) {
+              auto new_response = state.ready_responses.front();
+              assert (new_response.tensor_names().size() == 1);
+              auto &new_entry = state.tensor_table[new_response.tensor_names()[0]];
+              int64_t new_tensor_size = new_entry.tensor->size();
+              if (response.response_type() == new_response.response_type() &&
+                  response.devices() == new_response.devices() &&
+                  entry.tensor->dtype() == new_entry.tensor->dtype() &&
+                  tensor_size + new_tensor_size <= state.tensor_fusion_threshold) {
+                tensor_size += new_tensor_size;
+                response.add_tensor_names(new_response.tensor_names()[0]);
+                response.set_shutdown(response.shutdown() || new_response.shutdown() || state.shut_down);
+                state.ready_responses.pop_front();
+              } else {
+                break;
+              }
+            }
+          }
         }
       }
-      if (!resp.initialized()) {
+      if (response.initialized()) {
         Sleep(state);
         should_shut_down = state.shut_down;
         if (should_shut_down) {
@@ -1896,10 +1919,10 @@ void DataThreadLoop(HorovodGlobalState& state) {
         continue;
       }
 
-      std::cout << "response in datathread has shutdown " << resp.shutdown() << std::endl;
+      std::cout << "response in datathread has shutdown " << response.shutdown() << std::endl;
 
       std::string encoded_response;
-      MPIResponse::SerializeToString(resp, encoded_response);
+      MPIResponse::SerializeToString(response, encoded_response);
       int encoded_response_length = (int) encoded_response.length() + 1;
       MPI_Bcast(&encoded_response_length, 1, MPI_INT, RANK_ZERO, state.data_comm);
       MPI_Bcast((void*)encoded_response.c_str(), encoded_response_length,
@@ -1915,14 +1938,14 @@ void DataThreadLoop(HorovodGlobalState& state) {
       auto buffer = new char[msg_length];
       MPI_Bcast(buffer, msg_length, MPI_BYTE, RANK_ZERO, state.data_comm);
       std::string received_message(buffer, (size_t)msg_length);
-      MPIResponse::ParseFromString(resp, received_message);
+      MPIResponse::ParseFromString(response, received_message);
       delete[] buffer;
     }
 
     // TODO tensor_table.erase() in perform operation
-    PerformOperation(state.tensor_table, resp);
+    PerformOperation(state.tensor_table, response);
 
-    if (resp.shutdown()) {
+    if (response.shutdown()) {
       should_shut_down = true;
       state.shut_down = true;
       std::cout << "shutting down data thread for rank:" << rank << std::endl;
