@@ -1807,8 +1807,8 @@ bool RunLoopOnce(HorovodGlobalState& state, bool is_coordinator) {
       MPIResponse response =
           ConstructMPIResponse(state.message_table, tensor_name, should_shut_down);
       responses.push_front(std::move(response));
-      for (int i=0; i<response.tensor_names().size(); i++) {
-        std::cout << response.tensor_names()[i] << std::endl;
+      for (int i=0; i<responses.front().tensor_names().size(); i++) {
+        std::cout << responses.front().tensor_names()[i] << std::endl;
       }
     }
 
@@ -1818,7 +1818,7 @@ bool RunLoopOnce(HorovodGlobalState& state, bool is_coordinator) {
         auto resp = responses.back();
         responses.pop_back();
         state.ready_responses.push_front(resp);
-        std::cout << "pushed ready_response " << resp.tensor_names_string() << std::endl;
+        std::cout << "pushed ready_response " << state.ready_responses.front().tensor_names_string() << std::endl;
       }
     }
 
