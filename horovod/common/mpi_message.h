@@ -126,6 +126,7 @@ public:
   const std::vector<std::string>& tensor_names() const;
   void set_tensor_names(const std::vector<std::string>& value);
   void add_tensor_names(const std::string& value);
+  const std::string tensor_names_string() const;
 
   // Empty unless response_type is ERROR.
   const std::string& error_message() const;

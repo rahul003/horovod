@@ -17,6 +17,8 @@
 #include "mpi_message.h"
 #include "wire/mpi_message_generated.h"
 #include <iostream>
+// for accumulate
+#include <numeric>
 
 namespace horovod {
 namespace common {
@@ -249,6 +251,12 @@ void MPIResponse::set_response_type(ResponseType value) {
 
 const std::vector<std::string>& MPIResponse::tensor_names() const {
   return tensor_names_;
+}
+
+const std::string MPIResponse::tensor_names_string() const {
+  std::string s;
+  std::accumulate(std::begin(tensor_names()), std::end(tensor_names()), s);
+  return s;
 }
 
 void MPIResponse::set_tensor_names(const std::vector<std::string>& value) {
