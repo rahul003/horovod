@@ -422,7 +422,8 @@ def get_common_options(build_ext):
     SOURCES = ['horovod/common/common.cc',
                'horovod/common/mpi_message.cc',
                'horovod/common/operations.cc',
-               'horovod/common/timeline.cc']
+               'horovod/common/timeline.cc',
+               'horovod/common/logging.cc']
     COMPILE_FLAGS = cpp_flags + shlex.split(mpi_flags)
     LINK_FLAGS = link_flags + shlex.split(mpi_flags)
     LIBRARY_DIRS = []
