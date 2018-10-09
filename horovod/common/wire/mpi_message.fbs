@@ -92,6 +92,9 @@ table MPIResponse {
     // These tensor sizes are the dimension zero sizes of all the input matrices,
     // indexed by the rank.
     tensor_sizes:[long];
+
+    // Flag indicating if worker is requested to shutdown.
+    shutdown:bool;
 }
 table MPIResponseList {
     responses:[MPIResponse];

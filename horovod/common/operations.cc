@@ -1714,14 +1714,14 @@ bool RunLoopOnce(HorovodGlobalState& state, bool is_coordinator) {
     // message_deque will have same order as stack now
   }
 
+  bool should_shut_down = state.shut_down;
+
   if (message_deque.empty()) {
     Sleep(state);
-    return true;
+    return !should_shut_down;
   }
 
   // Flag indicating that the background thread should shut down.
-  bool should_shut_down = state.shut_down;
-
   // Collect all tensors that are ready to be reduced. Record them in the
   // tensor count table (rank zero) or send them to rank zero to be
   // recorded (everyone else).
@@ -1782,6 +1782,7 @@ bool RunLoopOnce(HorovodGlobalState& state, bool is_coordinator) {
         }
       }
       if (received_message_list.shutdown()) {
+        std::cout << state.rank << " Received SHUTDOWN request from one of the workers" << std::endl;
         // Received SHUTDOWN request from one of the workers.
         should_shut_down = true;
       }
@@ -1803,8 +1804,10 @@ bool RunLoopOnce(HorovodGlobalState& state, bool is_coordinator) {
     while (!ready_to_reduce.empty()) {
       auto tensor_name = ready_to_reduce.back();
       ready_to_reduce.pop_back();
+      std::cout << state.rank << ": should_shut_down in response is " << should_shut_down << std::endl;
       MPIResponse response =
           ConstructMPIResponse(state.message_table, tensor_name, should_shut_down);
+      std::cout << "response created has shutdown " << response.shutdown() << std::endl;
       responses.push_front(std::move(response));
     }
 
@@ -1884,8 +1887,17 @@ void DataThreadLoop(HorovodGlobalState& state) {
       }
       if (!resp.initialized()) {
         Sleep(state);
+        should_shut_down = state.shut_down;
+        if (should_shut_down) {
+          std::cout << "State.shutdown has become " << should_shut_down << std::endl;
+          int msg_length = 0;
+          MPI_Bcast(&msg_length, 1, MPI_INT, RANK_ZERO, state.data_comm);
+        }
         continue;
       }
+
+      std::cout << "response in datathread has shutdown " << resp.shutdown() << std::endl;
+
       std::string encoded_response;
       MPIResponse::SerializeToString(resp, encoded_response);
       int encoded_response_length = (int) encoded_response.length() + 1;
@@ -1896,6 +1908,10 @@ void DataThreadLoop(HorovodGlobalState& state) {
       int msg_length;
       // blocks till this call is made
       MPI_Bcast(&msg_length, 1, MPI_INT, RANK_ZERO, state.data_comm);
+      if (msg_length == 0) {
+        should_shut_down = true; 
+        continue; 
+      }
       auto buffer = new char[msg_length];
       MPI_Bcast(buffer, msg_length, MPI_BYTE, RANK_ZERO, state.data_comm);
       std::string received_message(buffer, (size_t)msg_length);
@@ -1905,12 +1921,13 @@ void DataThreadLoop(HorovodGlobalState& state) {
 
     // TODO tensor_table.erase() in perform operation
     PerformOperation(state.tensor_table, resp);
-    std::cout << "returned after perform operation";
 
     if (resp.shutdown()) {
       should_shut_down = true;
       state.shut_down = true;
       std::cout << "shutting down data thread for rank:" << rank << std::endl;
+    } else {
+      std::cout << "not shutting down data thread for rank:" << rank << std::endl;
     }
   }
   std::cout << "shut down data thread for rank:" << rank << std::endl;

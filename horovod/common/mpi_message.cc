@@ -301,6 +301,7 @@ void MPIResponse_ParseFromWire(MPIResponse& response,
     response.add_tensor_names(tensor_name_obj->str());
   }
   response.set_error_message(obj->error_message()->str());
+  response.set_shutdown(obj->shutdown());
   response.set_devices(
       std::vector<int32_t>(obj->devices()->begin(), obj->devices()->end()));
   response.set_tensor_sizes(std::vector<int64_t>(obj->tensor_sizes()->begin(),
@@ -330,6 +331,7 @@ void MPIResponse_SerializeToWire(const MPIResponse& response,
   response_builder.add_error_message(error_message_wire);
   response_builder.add_devices(devices_wire);
   response_builder.add_tensor_sizes(tensor_sizes_wire);
+  response_builder.add_shutdown(response.shutdown());
   obj = response_builder.Finish();
 }
 

@@ -308,7 +308,8 @@ struct MPIResponse FLATBUFFERS_FINAL_CLASS : private flatbuffers::Table {
     VT_TENSOR_NAMES = 6,
     VT_ERROR_MESSAGE = 8,
     VT_DEVICES = 10,
-    VT_TENSOR_SIZES = 12
+    VT_TENSOR_SIZES = 12, 
+    VT_SHUTDOWN = 14,
   };
   MPIResponseType response_type() const {
     return static_cast<MPIResponseType>(GetField<int8_t>(VT_RESPONSE_TYPE, 0));
@@ -325,6 +326,9 @@ struct MPIResponse FLATBUFFERS_FINAL_CLASS : private flatbuffers::Table {
   const flatbuffers::Vector<int64_t> *tensor_sizes() const {
     return GetPointer<const flatbuffers::Vector<int64_t> *>(VT_TENSOR_SIZES);
   }
+  const bool shutdown() const {
+    return GetField<uint8_t>(VT_SHUTDOWN, 0) != 0;
+  }
   bool Verify(flatbuffers::Verifier &verifier) const {
     return VerifyTableStart(verifier) &&
            VerifyField<int8_t>(verifier, VT_RESPONSE_TYPE) &&
@@ -337,6 +341,7 @@ struct MPIResponse FLATBUFFERS_FINAL_CLASS : private flatbuffers::Table {
            verifier.Verify(devices()) &&
            VerifyField<flatbuffers::uoffset_t>(verifier, VT_TENSOR_SIZES) &&
            verifier.Verify(tensor_sizes()) &&
+           VerifyField<uint8_t>(verifier, VT_SHUTDOWN) &&
            verifier.EndTable();
   }
 };
@@ -359,6 +364,9 @@ struct MPIResponseBuilder {
   void add_tensor_sizes(flatbuffers::Offset<flatbuffers::Vector<int64_t>> tensor_sizes) {
     fbb_.AddOffset(MPIResponse::VT_TENSOR_SIZES, tensor_sizes);
   }
+  void add_shutdown(bool shutdown) {
+    fbb_.AddElement<uint8_t>(MPIResponse::VT_SHUTDOWN, static_cast<uint8_t>(shutdown), 0);
+  }
   MPIResponseBuilder(flatbuffers::FlatBufferBuilder &_fbb)
         : fbb_(_fbb) {
     start_ = fbb_.StartTable();
@@ -377,13 +385,15 @@ inline flatbuffers::Offset<MPIResponse> CreateMPIResponse(
     flatbuffers::Offset<flatbuffers::Vector<flatbuffers::Offset<flatbuffers::String>>> tensor_names = 0,
     flatbuffers::Offset<flatbuffers::String> error_message = 0,
     flatbuffers::Offset<flatbuffers::Vector<int32_t>> devices = 0,
-    flatbuffers::Offset<flatbuffers::Vector<int64_t>> tensor_sizes = 0) {
+    flatbuffers::Offset<flatbuffers::Vector<int64_t>> tensor_sizes = 0,
+    bool shutdown = false) {
   MPIResponseBuilder builder_(_fbb);
   builder_.add_tensor_sizes(tensor_sizes);
   builder_.add_devices(devices);
   builder_.add_error_message(error_message);
   builder_.add_tensor_names(tensor_names);
   builder_.add_response_type(response_type);
+  builder_.add_shutdown(shutdown);
   return builder_.Finish();
 }
 
@@ -393,14 +403,16 @@ inline flatbuffers::Offset<MPIResponse> CreateMPIResponseDirect(
     const std::vector<flatbuffers::Offset<flatbuffers::String>> *tensor_names = nullptr,
     const char *error_message = nullptr,
     const std::vector<int32_t> *devices = nullptr,
-    const std::vector<int64_t> *tensor_sizes = nullptr) {
+    const std::vector<int64_t> *tensor_sizes = nullptr, 
+    const bool shutdown = false) {
   return horovod::common::wire::CreateMPIResponse(
       _fbb,
       response_type,
       tensor_names ? _fbb.CreateVector<flatbuffers::Offset<flatbuffers::String>>(*tensor_names) : 0,
       error_message ? _fbb.CreateString(error_message) : 0,
       devices ? _fbb.CreateVector<int32_t>(*devices) : 0,
-      tensor_sizes ? _fbb.CreateVector<int64_t>(*tensor_sizes) : 0);
+      tensor_sizes ? _fbb.CreateVector<int64_t>(*tensor_sizes) : 0, 
+      shutdown);
 }
 
 struct MPIResponseList FLATBUFFERS_FINAL_CLASS : private flatbuffers::Table {
