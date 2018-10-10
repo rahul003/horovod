@@ -1619,14 +1619,12 @@ void ControlThreadLoop(HorovodGlobalState& state) {
 
   // Signal that initialization is completed.
   state.initialization_done = true;
-
-  LOG(INFO) << "HVD Initialized";
   
   // Iterate until shutdown.
   while (RunControlLoopOnce(state, is_coordinator))
     ;
   
-  LOG(TRACE, rank) << "Shutting down control thread";
+  LOG(DEBUG, rank) << "Shutting down control thread";
 
   // Signal that shutdown has been requested.
   state.shut_down = true;
@@ -1703,6 +1701,7 @@ void Sleep(HorovodGlobalState& state) {
 //      If instead of "DONE" they receive "SHUTDOWN", they exit their background
 //      loop.
 bool RunControlLoopOnce(HorovodGlobalState& state, bool is_coordinator) {
+  int rank = state.rank;
   // Copy the data structures from global state under this lock.
   // However, don't keep the lock for the rest of the loop, so that
   // enqueued stream callbacks can continue.
@@ -1719,10 +1718,11 @@ bool RunControlLoopOnce(HorovodGlobalState& state, bool is_coordinator) {
 
   bool should_shut_down = state.shut_down;
 
-  if (message_deque.empty()) {
-    Sleep(state);
-    return !should_shut_down;
-  }
+  // if (message_deque.empty()) {
+    
+  //   // no point asking others if coordinator isn't ready anyway
+  //   return !should_shut_down;
+  // }
 
   // Flag indicating that the background thread should shut down.
   // Collect all tensors that are ready to be reduced. Record them in the
@@ -1730,6 +1730,7 @@ bool RunControlLoopOnce(HorovodGlobalState& state, bool is_coordinator) {
   // recorded (everyone else).
   std::deque<std::string> ready_to_reduce;
   if (is_coordinator) {
+    if (!message_deque.empty()) LOG(DEBUG, rank) << "Sent " << message_deque.size() << " messages"; 
     while (!message_deque.empty()) {
       // Pop the first available message message
       MPIRequest message = message_deque.back();
@@ -1785,7 +1786,7 @@ bool RunControlLoopOnce(HorovodGlobalState& state, bool is_coordinator) {
         }
       }
       if (received_message_list.shutdown()) {
-        LOG(TRACE, state.rank) << " Received SHUTDOWN request from a worker";
+        LOG(DEBUG, rank) << " Received SHUTDOWN request from a worker";
         should_shut_down = true;
       }
     }
@@ -1820,7 +1821,6 @@ bool RunControlLoopOnce(HorovodGlobalState& state, bool is_coordinator) {
         LOG(TRACE) << "Pushed a ready_response: " << state.ready_responses.front().tensor_names_string();
       }
     }
-
     // Check for stalled tensors.
     if (state.perform_stall_check &&
         std::chrono::steady_clock::now() - state.last_stall_check >
@@ -1829,7 +1829,6 @@ bool RunControlLoopOnce(HorovodGlobalState& state, bool is_coordinator) {
       state.last_stall_check = std::chrono::steady_clock::now();
     }
   } else {
-
     // send requests to coordinator
     std::string encoded_message;
     MPIRequestList message_list;
@@ -1845,28 +1844,9 @@ bool RunControlLoopOnce(HorovodGlobalState& state, bool is_coordinator) {
     MPI_Gatherv((void*)encoded_message.c_str(), encoded_message_length,
                 MPI_BYTE, nullptr, nullptr, nullptr, MPI_BYTE, RANK_ZERO,
                 state.control_comm);
-
-    // // receive response for which tensor to allreduce 
-    // int msg_length;
-    // MPI_Bcast(&msg_length, 1, MPI_INT, RANK_ZERO, state.mpi_comm);
-    // auto buffer = new char[msg_length];
-    // MPI_Bcast(buffer, msg_length, MPI_BYTE, RANK_ZERO, state.mpi_comm);
-    // std::string received_message(buffer, (size_t)msg_length);
-    // MPIResponse response;
-    // MPIResponse::ParseFromString(response, received_message);
-    // delete[] buffer;
-
-    // // Perform the collective operation. All nodes should end up performing
-    // // the same operation.
-    // PerformOperation(state.tensor_table, response);
-
-    // if (response.shutdown()) {
-    //   should_shut_down = true;
-    // }
+    if (message_list.requests().size()) LOG(TRACE, rank) << "Sent " << message_list.requests().size() << " messages";
   }
-
-  // TODO: should behavior be that if should_shutdown is true and tensor table empty
-  // then actually shutdown
+  Sleep(state);
   return (!should_shut_down);
 }
 
@@ -1881,7 +1861,6 @@ void DataThreadLoop(HorovodGlobalState& state) {
     if (is_coordinator) {
       {
         std::lock_guard<std::mutex> guard(state.mutex);
-
         if (!state.ready_responses.empty()) {
           response = state.ready_responses.front();
           assert(response.tensor_names().size() == 1);
@@ -1945,7 +1924,7 @@ void DataThreadLoop(HorovodGlobalState& state) {
 
     // TODO tensor_table.erase() in perform operation
     PerformOperation(state.tensor_table, response);
-    LOG(TRACE, rank) << "Finished working on response "<<  response.tensor_names_string();
+    LOG(TRACE, rank) << "Finished working on "<<  response.tensor_names_string();
     if (response.shutdown()) {
       should_shut_down = true;
       state.shut_down = true;
@@ -2143,6 +2122,7 @@ Status EnqueueTensorAllgather(std::shared_ptr<OpContext> context,
   if (!horovod_global.shut_down) {
     horovod_global.tensor_table.emplace(name, std::move(e));
     horovod_global.message_stack.push(message);
+    LOG(TRACE, horovod_global.rank) << "Enqueued " << name;
     return Status::OK();
   } else {
     return SHUT_DOWN_ERROR;
@@ -2182,6 +2162,7 @@ Status EnqueueTensorBroadcast(std::shared_ptr<OpContext> context,
   if (!horovod_global.shut_down) {
     horovod_global.tensor_table.emplace(name, std::move(e));
     horovod_global.message_stack.push(message);
+    LOG(TRACE, horovod_global.rank) << "Enqueued " << name;
     return Status::OK();
   } else {
     return SHUT_DOWN_ERROR;
