@@ -43,6 +43,7 @@
 #include "mpi_message.h"
 #include "operations.h"
 #include "timeline.h"
+#include "logging.h"
 
 /*
  * Allreduce, Allgather and Broadcast Ops.
@@ -1431,7 +1432,7 @@ void CheckForStalledTensors(HorovodGlobalState& state) {
 //      in the same order, so we cannot dispatch one thread per tensor,
 //      otherwise we may end up dispatching many blocked threads and never make
 //      progress if we have a thread pool limit.
-bool RunLoopOnce(HorovodGlobalState& state, bool is_coordinator);
+bool RunControlLoopOnce(HorovodGlobalState& state, bool is_coordinator);
 void ControlThreadLoop(HorovodGlobalState& state) {
   // Initialize MPI if it was not initialized. This must happen on the
   // background thread, since not all MPI implementations support being called
@@ -1620,7 +1621,7 @@ void ControlThreadLoop(HorovodGlobalState& state) {
   state.initialization_done = true;
 
   // Iterate until shutdown.
-  while (RunLoopOnce(state, is_coordinator))
+  while (RunControlLoopOnce(state, is_coordinator))
     ;
   
   LOG(TRACE, rank) << "Shutting down control thread";
@@ -1699,7 +1700,7 @@ void Sleep(HorovodGlobalState& state) {
 //      response from the coordinator. At that point, the tick ends.
 //      If instead of "DONE" they receive "SHUTDOWN", they exit their background
 //      loop.
-bool RunLoopOnce(HorovodGlobalState& state, bool is_coordinator) {
+bool RunControlLoopOnce(HorovodGlobalState& state, bool is_coordinator) {
   // Copy the data structures from global state under this lock.
   // However, don't keep the lock for the rest of the loop, so that
   // enqueued stream callbacks can continue.
@@ -1916,7 +1917,7 @@ void DataThreadLoop(HorovodGlobalState& state) {
         }
         continue;
       } else {
-        LOG(TRACE, rank) << "Processing " << response.tensor_names_string() << std::endl;
+        LOG(TRACE, rank) << "Processing " << response.tensor_names_string();
       }
 
       std::string encoded_response;
@@ -1942,7 +1943,7 @@ void DataThreadLoop(HorovodGlobalState& state) {
 
     // TODO tensor_table.erase() in perform operation
     PerformOperation(state.tensor_table, response);
-    LOG(TRACE) << "finished working on response "<<  response.tensor_names_string() << std::endl;
+    LOG(TRACE, rank) << "Finished working on response "<<  response.tensor_names_string();
     if (response.shutdown()) {
       should_shut_down = true;
       state.shut_down = true;
@@ -2104,6 +2105,7 @@ Status EnqueueTensorAllreduce(std::shared_ptr<OpContext> context,
 
     horovod_global.tensor_table.emplace(name, std::move(e));
     horovod_global.message_stack.push(message);
+    LOG(TRACE, horovod_global.rank) << "Enqueued " << name;
     return Status::OK();
   } else {
     return SHUT_DOWN_ERROR;

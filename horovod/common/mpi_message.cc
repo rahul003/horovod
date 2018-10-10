@@ -254,7 +254,6 @@ const std::vector<std::string>& MPIResponse::tensor_names() const {
 const std::string MPIResponse::tensor_names_string() const {
   std::string result;
   for (auto const& s : tensor_names_) { result += s; }
-  std::cout << "accum output " <<  result << std::endl;
   return result;
 }
 
