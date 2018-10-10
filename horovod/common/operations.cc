@@ -1623,7 +1623,7 @@ void ControlThreadLoop(HorovodGlobalState& state) {
   while (RunLoopOnce(state, is_coordinator))
     ;
   
-  std::cout << "shutting down control thread for rank:" << rank << std::endl;
+  LOG(TRACE, rank) << "Shutting down control thread";
 
   // Signal that shutdown has been requested.
   state.shut_down = true;
@@ -1782,8 +1782,7 @@ bool RunLoopOnce(HorovodGlobalState& state, bool is_coordinator) {
         }
       }
       if (received_message_list.shutdown()) {
-        std::cout << state.rank << " Received SHUTDOWN request from one of the workers" << std::endl;
-        // Received SHUTDOWN request from one of the workers.
+        LOG(TRACE, state.rank) << " Received SHUTDOWN request from a worker";
         should_shut_down = true;
       }
     }
@@ -1807,9 +1806,6 @@ bool RunLoopOnce(HorovodGlobalState& state, bool is_coordinator) {
       MPIResponse response =
           ConstructMPIResponse(state.message_table, tensor_name, should_shut_down);
       responses.push_front(std::move(response));
-      for (int i=0; i<responses.front().tensor_names().size(); i++) {
-        std::cout << responses.front().tensor_names()[i] << std::endl;
-      }
     }
 
     {
@@ -1818,7 +1814,7 @@ bool RunLoopOnce(HorovodGlobalState& state, bool is_coordinator) {
         auto resp = responses.back();
         responses.pop_back();
         state.ready_responses.push_front(resp);
-        std::cout << "pushed ready_response " << state.ready_responses.front().tensor_names_string() << std::endl;
+        LOG(TRACE) << "Pushed a ready_response: " << state.ready_responses.front().tensor_names_string();
       }
     }
 
@@ -1920,7 +1916,7 @@ void DataThreadLoop(HorovodGlobalState& state) {
         }
         continue;
       } else {
-        std::cout << "starting on response " << response.tensor_names_string() << std::endl;
+        LOG(TRACE, rank) << "Processing " << response.tensor_names_string() << std::endl;
       }
 
       std::string encoded_response;
@@ -1946,7 +1942,7 @@ void DataThreadLoop(HorovodGlobalState& state) {
 
     // TODO tensor_table.erase() in perform operation
     PerformOperation(state.tensor_table, response);
-    std::cout << "finished working on response "<<  response.tensor_names_string() << std::endl;
+    LOG(TRACE) << "finished working on response "<<  response.tensor_names_string() << std::endl;
     if (response.shutdown()) {
       should_shut_down = true;
       state.shut_down = true;
