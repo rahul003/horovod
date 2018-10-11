@@ -123,7 +123,7 @@ struct HorovodGlobalState {
   TensorTable tensor_table;
 
   // Stack of MPI requests waiting to be sent to the coordinator node.
-  std::stack<MPIRequest> message_stack;
+  std::deque<MPIRequest> message_deque;
 
   // Stack of tensors ready to reduce only used on coordinator node
   std::deque<MPIResponse> ready_responses;
@@ -1650,8 +1650,8 @@ void ControlThreadLoop(HorovodGlobalState& state) {
       callbacks.emplace_back(e.second.callback);
     }
     state.tensor_table.clear();
-    while (!state.message_stack.empty()) {
-      state.message_stack.pop();
+    while (!state.message_deque.empty()) {
+      state.message_deque.pop_front();
     }
   }
   for (auto& cb : callbacks) {
@@ -1707,13 +1707,21 @@ bool RunControlLoopOnce(HorovodGlobalState& state, bool is_coordinator) {
   // enqueued stream callbacks can continue.
   std::deque<MPIRequest> message_deque;
   {
+    std::deque<MPIRequest> not_ready_messages;
     std::lock_guard<std::mutex> guard(state.mutex);
-    while (!state.message_stack.empty()) {
-      auto msg = state.message_stack.top();
-      state.message_stack.pop();
-      message_deque.push_back(msg);
+    while (!state.message_deque.empty()) {
+      auto msg = state.message_deque.front();
+      state.message_deque.pop_front();
+      auto& ready_event = state.tensor_table[msg.tensor_name()].ready_event;
+      if (ready_event == nullptr || ready_event->Ready()) {
+        // Only process ready tensors.
+        message_deque.push_back(msg);
+      } else {
+        not_ready_messages.push_back(msg);
+      }
     }
-    // message_deque will have same order as stack now
+    state.message_deque.swap(not_ready_messages);
+    // both message_deque and not_ready_queue will have same order as stack now
   }
 
   bool should_shut_down = state.shut_down;
@@ -2085,7 +2093,7 @@ Status EnqueueTensorAllreduce(std::shared_ptr<OpContext> context,
   if (!horovod_global.shut_down) {
 
     horovod_global.tensor_table.emplace(name, std::move(e));
-    horovod_global.message_stack.push(message);
+    horovod_global.message_deque.push_front(message);
     LOG(TRACE, horovod_global.rank) << "Enqueued " << name;
     return Status::OK();
   } else {
@@ -2121,7 +2129,7 @@ Status EnqueueTensorAllgather(std::shared_ptr<OpContext> context,
   std::lock_guard<std::mutex> guard(horovod_global.mutex);
   if (!horovod_global.shut_down) {
     horovod_global.tensor_table.emplace(name, std::move(e));
-    horovod_global.message_stack.push(message);
+    horovod_global.message_deque.push_front(message);
     LOG(TRACE, horovod_global.rank) << "Enqueued " << name;
     return Status::OK();
   } else {
@@ -2161,7 +2169,7 @@ Status EnqueueTensorBroadcast(std::shared_ptr<OpContext> context,
   std::lock_guard<std::mutex> guard(horovod_global.mutex);
   if (!horovod_global.shut_down) {
     horovod_global.tensor_table.emplace(name, std::move(e));
-    horovod_global.message_stack.push(message);
+    horovod_global.message_deque.push_front(message);
     LOG(TRACE, horovod_global.rank) << "Enqueued " << name;
     return Status::OK();
   } else {
