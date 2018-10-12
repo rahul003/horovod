@@ -1729,8 +1729,9 @@ bool RunControlLoopOnce(HorovodGlobalState& state, bool is_coordinator) {
   // tensor count table (rank zero) or send them to rank zero to be
   // recorded (everyone else).
   std::deque<std::string> ready_to_reduce;
+
   if (is_coordinator) {
-    if (!message_deque.empty()) LOG(DEBUG, rank) << "Sent " << message_deque.size() << " messages"; 
+    if (!message_deque.empty()) LOG(TRACE, rank) << "Sent " << message_deque.size() << " messages"; 
     while (!message_deque.empty()) {
       // Pop the first available message message
       MPIRequest message = message_deque.back();
@@ -1746,6 +1747,8 @@ bool RunControlLoopOnce(HorovodGlobalState& state, bool is_coordinator) {
     // Rank zero has put all its own tensors in the tensor count table.
     // Now, it should count all the tensors that are coming from other
     // ranks at this tick.
+
+    auto t1 = std::chrono::high_resolution_clock::now();
 
     // 1. Get message lengths from every rank.
     auto recvcounts = new int[state.size];
@@ -1795,6 +1798,9 @@ bool RunControlLoopOnce(HorovodGlobalState& state, bool is_coordinator) {
     delete[] recvcounts;
     delete[] displcmnts;
     delete[] buffer;
+    auto t2 = std::chrono::high_resolution_clock::now();
+    std::chrono::duration<double, std::milli> fp_ms = t2 - t1;
+    // LOG(DEBUG) << "time in receiving " << fp_ms.count();
 
     // At this point, rank zero should have a fully updated tensor count
     // table and should know all the tensors that need to be reduced or
@@ -1898,7 +1904,8 @@ void DataThreadLoop(HorovodGlobalState& state) {
         }
         continue;
       } else {
-        LOG(TRACE, rank) << "Processing " << response.tensor_names_string();
+        LOG(TRACE) << "Processing " << response.tensor_names_string();
+        LOG(DEBUG) << "Processing " << response.tensor_names().size() << " tensors";
       }
 
       std::string encoded_response;
