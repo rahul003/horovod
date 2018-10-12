@@ -1892,6 +1892,7 @@ void DataThreadLoop(HorovodGlobalState& state) {
                 break;
               }
             }
+            LOG(DEBUG) << "Processing tensors of size " << tensor_size;
           }
         }
       }
