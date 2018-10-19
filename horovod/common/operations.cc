@@ -1628,7 +1628,7 @@ void ControlThreadLoop(HorovodGlobalState& state) {
 
   // Signal that initialization is completed.
   state.initialization_done = true;
-  
+
   // Iterate until shutdown.
   while (RunControlLoopOnce(state, is_coordinator))
     ;

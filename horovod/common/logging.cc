@@ -23,10 +23,10 @@ void LogMessage::GenerateLogMessage(bool log_time) {
     strftime(time_buffer, time_buffer_size, "%Y-%m-%d %H:%M:%S",
              localtime(&as_time_t));
 
-    fprintf(stdout, "[%s.%06d: %c %s:%d] %s\n", time_buffer, micros_remainder,
+    fprintf(stderr, "[%s.%06d: %c %s:%d] %s\n", time_buffer, micros_remainder,
             "TDIWEF"[severity_], fname_, line_, str().c_str());  
   } else {
-    fprintf(stdout, "[%c %s:%d] %s\n", "TDIWEF"[severity_], 
+    fprintf(stderr, "[%c %s:%d] %s\n", "TDIWEF"[severity_], 
             fname_, line_, str().c_str());  
   }
 }
