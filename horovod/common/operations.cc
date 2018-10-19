@@ -159,9 +159,11 @@ struct HorovodGlobalState {
   // Background thread cycle time in milliseconds.  Fractional numbers are
   // permitted.
   double cycle_time_ms = 5;
+  double data_cycle_time_ms = 5;
 
   // Time point when last cycle started.
   std::chrono::steady_clock::time_point last_cycle_start;
+  std::chrono::steady_clock::time_point last_data_cycle_start;
 
   // Memory buffers for Tensor Fusion.  They are keyed off device ID and
   // framework, and all are allocated tensor_fusion_threshold bytes if
@@ -205,7 +207,9 @@ struct HorovodGlobalState {
   MPI_Comm cross_comm;
 
   // Do hierarchical allreduce with MPI + NCCL.
-  bool hierarchical_allreduce = false;
+  bool hierarchical_allreduce = false; 
+
+  int missed = 0;
 
 // The CUDA stream used for data transfers and within-allreduce operations.
 // A naive implementation would use the TensorFlow StreamExecutor CUDA
@@ -1563,6 +1567,11 @@ void ControlThreadLoop(HorovodGlobalState& state) {
     state.cycle_time_ms = std::strtof(horovod_cycle_time, nullptr);
   }
 
+  auto horovod_data_cycle_time = std::getenv(HOROVOD_DATA_CYCLE_TIME);
+  if (horovod_data_cycle_time != nullptr) {
+    state.data_cycle_time_ms = std::strtof(horovod_data_cycle_time, nullptr);
+  }
+
   // Disable stall check.
   auto horovod_stall_check_disable = std::getenv(HOROVOD_STALL_CHECK_DISABLE);
   if (horovod_stall_check_disable != nullptr &&
@@ -1659,16 +1668,29 @@ void ControlThreadLoop(HorovodGlobalState& state) {
   }
 }
 
-void Sleep(HorovodGlobalState& state) {
+void Sleep(HorovodGlobalState& state, bool for_data = false) {
   // This delay determines thread frequency and MPI message latency
-  auto sleep_duration =
+  std::chrono::steady_clock::duration sleep_duration;
+  if (for_data) {
+    sleep_duration =
+      state.last_data_cycle_start +
+      std::chrono::microseconds(long(state.data_cycle_time_ms * 1000.)) -
+      std::chrono::steady_clock::now();  
+  } else {
+    sleep_duration =
       state.last_cycle_start +
       std::chrono::microseconds(long(state.cycle_time_ms * 1000.)) -
       std::chrono::steady_clock::now();
+  }
   if (sleep_duration > std::chrono::steady_clock::duration::zero()) {
     std::this_thread::sleep_for(sleep_duration);
   }
-  state.last_cycle_start = std::chrono::steady_clock::now();
+  if (for_data) {
+    state.last_data_cycle_start = std::chrono::steady_clock::now();  
+  } else {
+    state.last_cycle_start = std::chrono::steady_clock::now();
+  }
+  
 }
 
 // The coordinator currently follows a master-worker paradigm. Rank zero acts
@@ -1780,6 +1802,7 @@ bool RunControlLoopOnce(HorovodGlobalState& state, bool is_coordinator) {
       MPIRequestList received_message_list;
       MPIRequestList::ParseFromString(received_message_list, received_data);
       for (auto& received_message : received_message_list.requests()) {
+        assert(received_message.request_rank_<state.size);
         auto& received_name = received_message.tensor_name();
 
         bool reduce = IncrementTensorCount(state.message_table,
@@ -1798,8 +1821,8 @@ bool RunControlLoopOnce(HorovodGlobalState& state, bool is_coordinator) {
     delete[] recvcounts;
     delete[] displcmnts;
     delete[] buffer;
-    auto t2 = std::chrono::high_resolution_clock::now();
-    std::chrono::duration<double, std::milli> fp_ms = t2 - t1;
+    // auto t2 = std::chrono::high_resolution_clock::now();
+    // std::chrono::duration<double, std::milli> fp_ms = t2 - t1;
     // LOG(DEBUG) << "time in receiving " << fp_ms.count();
 
     // At this point, rank zero should have a fully updated tensor count
@@ -1823,7 +1846,7 @@ bool RunControlLoopOnce(HorovodGlobalState& state, bool is_coordinator) {
       while (!responses.empty()) {
         auto resp = responses.back();
         responses.pop_back();
-        state.ready_responses.push_front(resp);
+        state.ready_responses.push_front(std::move(resp));
         LOG(TRACE) << "Pushed a ready_response: " << state.ready_responses.front().tensor_names_string();
       }
     }
@@ -1843,13 +1866,14 @@ bool RunControlLoopOnce(HorovodGlobalState& state, bool is_coordinator) {
       message_list.add_requests(message_deque.front());
       message_deque.pop_front();
     }
+
     MPIRequestList::SerializeToString(message_list, encoded_message);
     int encoded_message_length = (int)encoded_message.length() + 1;
     MPI_Gather(&encoded_message_length, 1, MPI_INT, nullptr, 1, MPI_INT,
                RANK_ZERO, state.control_comm);
     MPI_Gatherv((void*)encoded_message.c_str(), encoded_message_length,
                 MPI_BYTE, nullptr, nullptr, nullptr, MPI_BYTE, RANK_ZERO,
-                state.control_comm);
+                state.control_comm);  
     if (message_list.requests().size()) LOG(TRACE, rank) << "Sent " << message_list.requests().size() << " messages";
   }
   Sleep(state);
@@ -1867,6 +1891,7 @@ void DataThreadLoop(HorovodGlobalState& state) {
     if (is_coordinator) {
       {
         std::lock_guard<std::mutex> guard(state.mutex);
+        auto copy_responses = state.ready_responses;
         if (!state.ready_responses.empty()) {
           response = state.ready_responses.front();
           assert(response.tensor_names().size() == 1);
@@ -1888,16 +1913,22 @@ void DataThreadLoop(HorovodGlobalState& state) {
                 response.add_tensor_names(new_response.tensor_names()[0]);
                 response.set_shutdown(response.shutdown() || new_response.shutdown() || state.shut_down);
                 state.ready_responses.pop_front();
-              } else {
-                break;
-              }
+              } 
             }
-            LOG(DEBUG) << "Processing tensors of size " << tensor_size;
+            // also try bypassing the break
+            // if (tensor_size < (state.tensor_fusion_threshold / 2) && state.missed < 50) {
+            //   state.ready_responses.swap(copy_responses);
+            //   response.set_initialized(false);
+            //   state.missed += 1;
+            // } else {
+            //   state.missed = 0;
+            LOG(DEBUG) << "Processing tensors of size " << tensor_size;  
+            // }
           }
         }
       }
       if (!response.initialized()) {
-        Sleep(state);
+        Sleep(state, true);
         should_shut_down = state.shut_down;
         if (should_shut_down) {
           int msg_length = 0;
@@ -1937,6 +1968,7 @@ void DataThreadLoop(HorovodGlobalState& state) {
       should_shut_down = true;
       state.shut_down = true;
     }
+    Sleep(state, true);
   }
 }
 

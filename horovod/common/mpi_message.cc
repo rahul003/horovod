@@ -162,7 +162,7 @@ void MPIRequest::SerializeToString(MPIRequest& request, std::string& output) {
   flatbuffers::Offset<wire::MPIRequest> obj;
   MPIRequest_SerializeToWire(request, builder, obj);
   builder.Finish(obj);
-
+  
   uint8_t* buf = builder.GetBufferPointer();
   auto size = builder.GetSize();
   output = std::string((char*)buf, size);
